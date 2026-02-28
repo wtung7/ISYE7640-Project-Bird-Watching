@@ -11,7 +11,6 @@ library(tigris)
 library(spThin)
 library(dplyr)
 
-# ---- Set your base project path ----------------------------
 base_path <- "/Users/agiri/Downloads/7406 proj"
 
 # ============================================================
@@ -33,7 +32,6 @@ pnw_vect       <- project(pnw_vect, crs(worldclim))
 worldclim_crop <- crop(worldclim, pnw_vect)
 worldclim_pnw  <- mask(worldclim_crop, pnw_vect)
 
-# verify
 plot(worldclim_pnw[[1]], main = "WorldClim BIO1 - Mean Annual Temp (PNW)")
 cat("WorldClim loaded successfully --", nlyr(worldclim_pnw), "layers\n")
 
@@ -112,12 +110,12 @@ process_species <- function(folder_name, species_code, common_name) {
   # drop any NULL states (missing files) and combine
   all_states   <- Filter(Negate(is.null), all_states)
   ebd_combined <- bind_rows(all_states)
-  cat("  Total records across 3 states:", nrow(ebd_combined), "\n")
+  cat("Total records across 3 states:", nrow(ebd_combined), "\n")
   
   # cap presence records at 20,000 so all species are comparable
   n_presence <- sum(ebd_combined$presence == 1)
   n_absence  <- sum(ebd_combined$presence == 0)
-  cat("  Presences:", n_presence, "| Absences:", n_absence, "\n")
+  cat("Presences:", n_presence, "| Absences:", n_absence, "\n")
   
   presence_idx <- which(ebd_combined$presence == 1)
   absence_idx  <- which(ebd_combined$presence == 0)
@@ -132,7 +130,7 @@ process_species <- function(folder_name, species_code, common_name) {
   }
   
   ebd_combined <- ebd_combined[c(presence_idx, absence_idx), ]
-  cat("  After capping -- presences:", sum(ebd_combined$presence == 1), "| absences:", sum(ebd_combined$presence == 0), "\n")
+  cat("After capping -- presences:", sum(ebd_combined$presence == 1), "| absences:", sum(ebd_combined$presence == 0), "\n")
   
   
   # keep only necessary columns
@@ -146,7 +144,7 @@ process_species <- function(folder_name, species_code, common_name) {
   ebd_sf  <- st_as_sf(ebd_clean, coords = c("longitude", "latitude"), crs = 4326)
   pnw_sf  <- st_transform(pnw_sf, st_crs(ebd_sf))
   ebd_pnw <- ebd_sf[st_within(ebd_sf, pnw_sf, sparse = FALSE), ]
-  cat("  Records after clipping to PNW:", nrow(ebd_pnw), "\n")
+  cat("Records after clipping to PNW:", nrow(ebd_pnw), "\n")
   
   # spatial thinning on presence points only to reduce sampling bias
   presence_pts <- ebd_pnw[ebd_pnw$presence == 1, ]
@@ -179,17 +177,41 @@ process_species <- function(folder_name, species_code, common_name) {
 }
 
 # -- Process all five species --
-robin      <- process_species("american robin",    "amerob", "American Robin")
-jay        <- process_species("stellers jay",      "stejay",  "Steller's Jay")
-hawk       <- process_species("red tailed hawk",   "rethaw",  "Red-tailed Hawk")
-towhee     <- process_species("spotted towhee",    "spotow",  "Spotted Towhee")
+robin <- process_species("american robin",    "amerob", "American Robin")
+jay <- process_species("stellers jay",      "stejay",  "Steller's Jay")
+hawk <- process_species("red tailed hawk",   "rethaw",  "Red-tailed Hawk")
+towhee <- process_species("spotted towhee",    "spotow",  "Spotted Towhee")
 meadowlark <- process_species("western meadowlark","wesmea",  "Western Meadowlark")
 
 # ============================================================
-# STEP 4: EXTRACT ENVIRONMENTAL VALUES AT OCCURRENCE POINTS
+# STEP 4: LOAD AND PREPARE MODIS LAND COVER
 # ============================================================
-# Pull WorldClim values at each presence/absence point
-# This creates the feature matrix
+modis_folder <- file.path(base_path, "MCD12Q1_061-20260228_225325")
+modis_files  <- list.files(modis_folder, pattern = "\\.hdf$",
+                           full.names = TRUE, recursive = FALSE)
+cat("MODIS files found:", length(modis_files), "\n")
+
+# load LC_Type1 (band 1) from each tile
+modis_tiles <- lapply(modis_files, function(f) {
+  sds(f)[[1]]  # band 1 = LC_Type1
+})
+
+# mosaic all three tiles into one raster
+modis_mosaic <- do.call(mosaic, modis_tiles)
+
+# reproject to match WorldClim CRS (WGS84)
+modis_wgs84 <- project(modis_mosaic, crs(worldclim_pnw), method = "near")
+
+# crop and mask to PNW state boundaries
+modis_crop <- crop(modis_wgs84, pnw_vect)
+modis_pnw  <- mask(modis_crop, pnw_vect)
+
+cat("MODIS land cover prepared successfully\n")
+
+# ============================================================
+# STEP 5: EXTRACT ENVIRONMENTAL VALUES AT OCCURRENCE POINTS
+# ============================================================
+# Pull WorldClim + MODIS values at each presence/absence point
 
 extract_env <- function(species_sf, common_name) {
   
@@ -198,19 +220,27 @@ extract_env <- function(species_sf, common_name) {
   # convert to terra format
   pts <- vect(species_sf)
   
-  # extract WorldClim values at each point
+  # extract WorldClim values
   wc_vals <- extract(worldclim_pnw, pts, ID = FALSE)
   
-  # combine with presence/absence column
-  coords     <- st_coordinates(species_sf)
-  env_data   <- cbind(
+  # extract MODIS land cover value
+  lc_vals <- extract(modis_pnw, pts, ID = FALSE)
+  names(lc_vals) <- "land_cover"
+  
+  # combine everything
+  coords   <- st_coordinates(species_sf)
+  env_data <- cbind(
     data.frame(
       presence  = species_sf$presence,
       longitude = coords[, 1],
       latitude  = coords[, 2]
     ),
-    wc_vals
+    wc_vals,
+    lc_vals
   )
+  
+  # convert land cover to factor so models treat it as categorical
+  env_data$land_cover <- as.factor(env_data$land_cover)
   
   env_data$species <- common_name
   
@@ -223,14 +253,14 @@ extract_env <- function(species_sf, common_name) {
   return(env_data)
 }
 
-robin_env      <- extract_env(robin,      "American Robin")
-jay_env        <- extract_env(jay,        "Steller's Jay")
-hawk_env       <- extract_env(hawk,       "Red-tailed Hawk")
-towhee_env     <- extract_env(towhee,     "Spotted Towhee")
+robin_env <- extract_env(robin,      "American Robin")
+jay_env <- extract_env(jay,        "Steller's Jay")
+hawk_env <- extract_env(hawk,       "Red-tailed Hawk")
+towhee_env <- extract_env(towhee,     "Spotted Towhee")
 meadowlark_env <- extract_env(meadowlark, "Western Meadowlark")
 
 # ============================================================
-# STEP 5: SAVE PROCESSED DATA
+# STEP 6: SAVE PROCESSED DATA
 # ============================================================
 output_path <- file.path(base_path, "processed")
 dir.create(output_path, showWarnings = FALSE)
