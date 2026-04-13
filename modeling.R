@@ -93,10 +93,13 @@ load_species_data <- function(csv_file) {
 # ---- LASSO tuning ------------------------------------------
 tune_lasso <- function(X_train, y_train) {
   cat("    Tuning LASSO...\n")
-  alpha_grid <- runif(N_SEARCH, 0.5, 1.0)
-  best_auc   <- -Inf
-  best_alpha <- 1
+  alpha_grid  <- runif(N_SEARCH, 0.5, 1.0)
+  best_auc    <- -Inf
+  best_alpha  <- 1
   best_lambda <- NULL
+
+  # store full CV curve for the best alpha (for tuning plot)
+  best_cv_fit <- NULL
 
   for (a in alpha_grid) {
     cv_fit <- cv.glmnet(X_train, y_train, alpha = a,
@@ -106,11 +109,21 @@ tune_lasso <- function(X_train, y_train) {
       best_auc    <- max(cv_fit$cvm)
       best_alpha  <- a
       best_lambda <- cv_fit$lambda.min
+      best_cv_fit <- cv_fit
     }
   }
   cat("    Best alpha:", round(best_alpha, 3),
       "| Best lambda:", round(best_lambda, 5), "\n")
-  list(alpha = best_alpha, lambda = best_lambda)
+
+  # build lambda curve dataframe for plotting
+  lambda_df <- data.frame(
+    log_lambda = log(best_cv_fit$lambda),
+    auc        = best_cv_fit$cvm,
+    auc_hi     = best_cv_fit$cvm + best_cv_fit$cvsd,
+    auc_lo     = best_cv_fit$cvm - best_cv_fit$cvsd
+  )
+
+  list(alpha = best_alpha, lambda = best_lambda, lambda_df = lambda_df)
 }
 
 # ---- Random Forest tuning ----------------------------------
@@ -125,6 +138,15 @@ tune_rf <- function(X_train, y_train) {
   best_params <- list(mtry = floor(sqrt(ncol(X_train))),
                       ntree = 500, nodesize = 1)
 
+  # record all search results for tuning plot
+  search_log <- data.frame(
+    iter     = 1:N_SEARCH,
+    mtry     = mtry_vals,
+    ntree    = ntree_vals,
+    nodesize = nodesize_vals,
+    auc      = NA_real_
+  )
+
   for (i in 1:N_SEARCH) {
     rf_fit <- randomForest(x = X_train, y = as.factor(y_train),
                             mtry     = mtry_vals[i],
@@ -132,6 +154,7 @@ tune_rf <- function(X_train, y_train) {
                             nodesize = nodesize_vals[i])
     pred    <- predict(rf_fit, X_train, type = "prob")[, 2]
     auc_val <- as.numeric(auc(roc(y_train, pred, quiet = TRUE)))
+    search_log$auc[i] <- auc_val
 
     if (auc_val > best_auc) {
       best_auc    <- auc_val
@@ -143,7 +166,8 @@ tune_rf <- function(X_train, y_train) {
   cat("    Best mtry:", best_params$mtry,
       "| ntree:", best_params$ntree,
       "| nodesize:", best_params$nodesize, "\n")
-  best_params
+
+  c(best_params, list(search_log = search_log))
 }
 
 # ---- XGBoost tuning ----------------------------------------
@@ -153,14 +177,18 @@ tune_xgb <- function(X_train, y_train) {
 
   best_auc <- -Inf
   best_params <- list(
-    eta = 0.1,
-    max_depth = 6,
-    subsample = 0.8,
-    colsample_bytree = 0.8,
-    min_child_weight = 1,
-    objective = "binary:logistic",
-    eval_metric = "auc",
+    eta = 0.1, max_depth = 6, subsample = 0.8,
+    colsample_bytree = 0.8, min_child_weight = 1,
+    objective = "binary:logistic", eval_metric = "auc",
     nrounds = 100
+  )
+
+  # record all search results for tuning plot
+  search_log <- data.frame(
+    iter      = 1:N_SEARCH,
+    eta       = NA_real_,
+    max_depth = NA_integer_,
+    auc       = NA_real_
   )
 
   for (i in 1:N_SEARCH) {
@@ -173,18 +201,11 @@ tune_xgb <- function(X_train, y_train) {
       colsample_bytree = runif(1, 0.6, 1.0),
       min_child_weight = sample(1:10, 1)
     )
-
     nrounds <- sample(c(50, 100, 150, 200), 1)
 
     cv_result <- tryCatch(
-      xgb.cv(
-        params = params,
-        data = dtrain,
-        nrounds = nrounds,
-        nfold = 3,
-        verbose = FALSE,
-        early_stopping_rounds = 10
-      ),
+      xgb.cv(params = params, data = dtrain, nrounds = nrounds,
+              nfold = 3, verbose = FALSE, early_stopping_rounds = 10),
       error = function(e) NULL
     )
 
@@ -193,8 +214,7 @@ tune_xgb <- function(X_train, y_train) {
     auc_col <- cv_result$evaluation_log$test_auc_mean
     if (is.null(auc_col) || length(auc_col) == 0) next
 
-    auc_val <- max(auc_col, na.rm = TRUE)
-
+    auc_val   <- max(auc_col, na.rm = TRUE)
     best_iter <- cv_result$best_iteration
     if (is.null(best_iter) || length(best_iter) == 0 || is.na(best_iter)) {
       best_iter <- which.max(auc_col)
@@ -203,8 +223,12 @@ tune_xgb <- function(X_train, y_train) {
       best_iter <- nrounds
     }
 
+    search_log$eta[i]       <- params$eta
+    search_log$max_depth[i] <- params$max_depth
+    search_log$auc[i]       <- auc_val
+
     if (auc_val > best_auc) {
-      best_auc <- auc_val
+      best_auc    <- auc_val
       best_params <- c(params, list(nrounds = best_iter))
     }
   }
@@ -213,7 +237,7 @@ tune_xgb <- function(X_train, y_train) {
       "| max_depth:", best_params$max_depth,
       "| nrounds:", best_params$nrounds, "\n")
 
-  best_params
+  c(best_params, list(search_log = search_log))
 }
 
 # ============================================================
@@ -262,6 +286,11 @@ run_models <- function(species_name, csv_file) {
   best_hp[["Random Forest"]]  <- rf_hp
   best_hp[["XGBoost"]]        <- xgb_hp
 
+  # tag tuning logs with species for combined plots
+  lasso_hp$lambda_df$species <- species_name
+  rf_hp$search_log$species   <- species_name
+  xgb_hp$search_log$species  <- species_name
+
   # ---- 5-fold CV with tuned hyperparameters ------------------
   cat("\n  Running 5-fold CV with tuned parameters...\n")
 
@@ -308,7 +337,7 @@ run_models <- function(species_name, csv_file) {
     # -- 4. XGBoost --------------------------------------------
     dtrain  <- xgb.DMatrix(data = X_train, label = y_train)
     dtest   <- xgb.DMatrix(data = X_test,  label = y_test)
-    xgb_params <- xgb_hp[!names(xgb_hp) %in% "nrounds"]
+    xgb_params <- xgb_hp[!names(xgb_hp) %in% c("nrounds", "search_log")]
     xgb_mod <- xgb.train(params  = xgb_params,
                           data    = dtrain,
                           nrounds = xgb_hp$nrounds,
@@ -355,7 +384,7 @@ run_models <- function(species_name, csv_file) {
 
   # -- XGBoost importance --
   dtrain_full <- xgb.DMatrix(data = X, label = y)
-  xgb_params  <- xgb_hp[!names(xgb_hp) %in% "nrounds"]
+  xgb_params  <- xgb_hp[!names(xgb_hp) %in% c("nrounds", "search_log")]
   xgb_full    <- xgb.train(params  = xgb_params,
                              data    = dtrain_full,
                              nrounds = xgb_hp$nrounds,
@@ -399,12 +428,15 @@ run_models <- function(species_name, csv_file) {
   shap_means$species   <- species_name
 
   list(
-    cv_summary = cv_summary,
-    importance = importance_df,
-    shap       = shap_means,
-    best_hp    = best_hp,
-    rf_model   = rf_full,
-    xgb_model  = xgb_full
+    cv_summary  = cv_summary,
+    importance  = importance_df,
+    shap        = shap_means,
+    best_hp     = best_hp,
+    rf_model    = rf_full,
+    xgb_model   = xgb_full,
+    lasso_curve = lasso_hp$lambda_df,
+    rf_search   = rf_hp$search_log,
+    xgb_search  = xgb_hp$search_log
   )
 }
 
@@ -418,9 +450,12 @@ for (sp in names(species_files)) {
 }
 
 # combine results
-cv_all   <- bind_rows(lapply(all_results, `[[`, "cv_summary"))
-imp_all  <- bind_rows(lapply(all_results, `[[`, "importance"))
-shap_all <- bind_rows(lapply(all_results, `[[`, "shap"))
+cv_all       <- bind_rows(lapply(all_results, `[[`, "cv_summary"))
+imp_all      <- bind_rows(lapply(all_results, `[[`, "importance"))
+shap_all     <- bind_rows(lapply(all_results, `[[`, "shap"))
+lasso_curves <- bind_rows(lapply(all_results, `[[`, "lasso_curve"))
+rf_searches  <- bind_rows(lapply(all_results, `[[`, "rf_search"))
+xgb_searches <- bind_rows(lapply(all_results, `[[`, "xgb_search"))
 
 hp_rows <- lapply(names(all_results), function(sp) {
   hp <- all_results[[sp]]$best_hp
@@ -569,6 +604,61 @@ p_acc <- ggplot(cv_all, aes(x = fct_reorder(model, mean_accuracy),
 ggsave(file.path(plot_path, "accuracy_by_model_species.png"),
        p_acc, width = 10, height = 8, dpi = 150)
 
+# ---- Tuning Plot 1: LASSO lambda curve (combined) ----------
+p_lasso_tune <- ggplot(lasso_curves,
+                        aes(x = log_lambda, y = auc)) +
+  geom_line(color = "#1565C0", linewidth = 0.8) +
+  geom_ribbon(aes(ymin = auc_lo, ymax = auc_hi),
+              alpha = 0.15, fill = "#1565C0") +
+  geom_vline(data = lasso_curves |>
+               group_by(species) |>
+               slice_max(auc, n = 1),
+             aes(xintercept = log_lambda),
+             linetype = "dashed", color = "red", linewidth = 0.7) +
+  facet_wrap(~ species, ncol = 2, scales = "free_x") +
+  labs(title    = "LASSO Tuning: AUC vs log(lambda)",
+       subtitle = "Red dashed line = selected lambda.min",
+       x        = "log(lambda)",
+       y        = "Cross-validated AUC") +
+  theme_bw()
+
+ggsave(file.path(plot_path, "tuning_lasso_lambda_curve.png"),
+       p_lasso_tune, width = 10, height = 8, dpi = 150)
+
+# ---- Tuning Plot 2: Random Forest mtry search (combined) ---
+p_rf_tune <- ggplot(rf_searches,
+                     aes(x = mtry, y = auc, color = species)) +
+  geom_point(size = 2.5, alpha = 0.7) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 0.8) +
+  facet_wrap(~ species, ncol = 2) +
+  labs(title    = "Random Forest Tuning: AUC vs mtry",
+       subtitle = "Each point = one random search iteration",
+       x        = "mtry (variables sampled per split)",
+       y        = "AUC (training)") +
+  theme_bw() +
+  theme(legend.position = "none")
+
+ggsave(file.path(plot_path, "tuning_rf_mtry_search.png"),
+       p_rf_tune, width = 10, height = 8, dpi = 150)
+
+# ---- Tuning Plot 3: XGBoost eta vs AUC (combined) ----------
+p_xgb_tune <- ggplot(xgb_searches |> filter(!is.na(auc)),
+                      aes(x = eta, y = auc,
+                          color = as.factor(max_depth))) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  facet_wrap(~ species, ncol = 2) +
+  scale_color_brewer(palette = "RdYlGn", name = "max_depth") +
+  labs(title    = "XGBoost Tuning: AUC vs Learning Rate (eta)",
+       subtitle = "Color = max_depth; each point = one random search iteration",
+       x        = "eta (learning rate)",
+       y        = "Cross-validated AUC") +
+  theme_bw()
+
+ggsave(file.path(plot_path, "tuning_xgb_eta_search.png"),
+       p_xgb_tune, width = 10, height = 8, dpi = 150)
+
+cat("  Tuning plots saved\n")
+
 # ---- Summary -----------------------------------------------
 cat("\nBest Hyperparameters per Species:\n")
 print(hp_all)
@@ -589,4 +679,7 @@ cat("    rq3_shap_importance.png           -- top predictors (SHAP)\n")
 cat("    rq4_complexity_vs_performance.png -- answers RQ4\n")
 cat("    accuracy_by_model_species.png     -- secondary metric\n")
 cat("    [species]_shap.png                -- per-species SHAP beeswarm plots\n")
+cat("    tuning_lasso_lambda_curve.png     -- LASSO lambda CV curve\n")
+cat("    tuning_rf_mtry_search.png         -- RF random search: mtry vs AUC\n")
+cat("    tuning_xgb_eta_search.png         -- XGBoost random search: eta vs AUC\n")
 cat("============================================================\n")
