@@ -1,6 +1,6 @@
 "species","lasso_alpha","lasso_lambda","rf_mtry","rf_ntree","rf_nodesize","xgb_eta","xgb_depth","xgb_nrounds"
-"American Robin",0.746,1e-05,20,500,1,0.038,4,64
-"Steller's Jay",0.694,4e-05,13,500,1,0.091,6,37
-"Red-tailed Hawk",0.508,0.00017,12,300,1,0.029,8,31
-"Spotted Towhee",0.7,1e-05,12,200,1,0.012,8,86
-"Western Meadowlark",0.588,2e-05,19,300,1,0.061,6,83
+"American Robin",0.746,1e-05,20,500,1,0.038,4,36
+"Steller's Jay",0.694,4e-05,13,500,1,0.091,6,38
+"Red-tailed Hawk",0.508,0.00017,12,300,1,0.029,8,36
+"Spotted Towhee",0.7,1e-05,12,200,1,0.153,7,20
+"Western Meadowlark",0.588,2e-05,19,300,1,0.061,6,82
